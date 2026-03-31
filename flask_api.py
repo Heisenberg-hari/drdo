@@ -123,7 +123,12 @@ def predict_from_payload(payload: dict) -> tuple[dict | None, str | None]:
 
     try:
         if ctx["imputer"] is not None:
-            sample[NUM_COLS] = ctx["imputer"].transform(sample[NUM_COLS])
+            try:
+                sample[NUM_COLS] = ctx["imputer"].transform(sample[NUM_COLS])
+            except Exception:
+                # Fallback for sklearn version mismatch in serialized SimpleImputer.
+                # Inputs are required numeric fields, so continue with provided values.
+                pass
         sample = _clip_physically_impossible(sample)
         engineered = _engineer_features(sample)
 
