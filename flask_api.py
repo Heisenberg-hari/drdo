@@ -19,7 +19,22 @@ NUM_COLS = [
 ]
 
 app = Flask(__name__)
-bundle = joblib.load(MODEL_PATH)
+bundle = None
+bundle_error: str | None = None
+
+
+def get_bundle() -> dict | None:
+    global bundle
+    global bundle_error
+    if bundle is not None:
+        return bundle
+    try:
+        bundle = joblib.load(MODEL_PATH)
+        bundle_error = None
+        return bundle
+    except Exception as exc:
+        bundle_error = f"Failed to load model.joblib: {exc}"
+        return None
 
 
 def estimate_remaining_minutes(pulse: float, spo2: float, temp: float, motion: float, body_pressure: float) -> float:
@@ -44,9 +59,13 @@ def _clip_physically_impossible(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    model_bundle = get_bundle()
+    if model_bundle is None:
+        raise RuntimeError(bundle_error or "Model bundle is not available.")
+
     out = df.copy()
-    motion_median = float(bundle.get("motion_median", 0.0))
-    use_poly = bool(bundle.get("use_poly", False))
+    motion_median = float(model_bundle.get("motion_median", 0.0))
+    use_poly = bool(model_bundle.get("use_poly", False))
 
     out["pulse_temp_ratio"] = out["pulse_bpm"] / (out["temperature_c"] + 1e-6)
     out["pressure_diff"] = out["external_pressure"] - out["body_pressure"]
@@ -63,6 +82,10 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def predict_from_payload(payload: dict) -> tuple[dict | None, str | None]:
+    model_bundle = get_bundle()
+    if model_bundle is None:
+        return None, bundle_error or "Model could not be loaded."
+
     missing = [col for col in NUM_COLS if col not in payload]
     if missing:
         return None, f"Missing required fields: {missing}"
@@ -72,12 +95,14 @@ def predict_from_payload(payload: dict) -> tuple[dict | None, str | None]:
     except (TypeError, ValueError):
         return None, "All input fields must be numeric."
 
-    sample[NUM_COLS] = bundle["imputer"].transform(sample[NUM_COLS])
+    sample[NUM_COLS] = model_bundle["imputer"].transform(sample[NUM_COLS])
     sample = _clip_physically_impossible(sample)
     sample = _engineer_features(sample)
 
-    dead_probability = float(bundle["model"].predict_proba(sample[bundle["feature_cols"]])[:, 1][0])
-    threshold = float(bundle["threshold"])
+    dead_probability = float(
+        model_bundle["model"].predict_proba(sample[model_bundle["feature_cols"]])[:, 1][0]
+    )
+    threshold = float(model_bundle["threshold"])
     status = "Dead" if dead_probability >= threshold else "Alive"
 
     response = {
@@ -101,6 +126,7 @@ def predict_from_payload(payload: dict) -> tuple[dict | None, str | None]:
 
 @app.route("/", methods=["GET", "POST"])
 def home():
+    get_bundle()
     defaults = {
         "pulse_bpm": "72",
         "temperature_c": "36.8",
@@ -111,11 +137,13 @@ def home():
     }
     result = None
     error = None
+    model_load_error = bundle_error
 
     if request.method == "POST":
         payload = {k: request.form.get(k, "").strip() for k in NUM_COLS}
         defaults.update(payload)
         result, error = predict_from_payload(payload)
+        model_load_error = bundle_error
 
     return render_template_string(
         """
@@ -148,6 +176,9 @@ def home():
     {% if error %}
       <div class="err">{{ error }}</div>
     {% endif %}
+    {% if model_load_error %}
+      <div class="err">{{ model_load_error }}</div>
+    {% endif %}
     {% if result %}
       <div class="res">
         <div><b>Status:</b> {{ result["status"] }}</div>
@@ -166,6 +197,7 @@ def home():
         defaults=defaults,
         result=result,
         error=error,
+        model_load_error=model_load_error,
     )
 
 
@@ -180,6 +212,19 @@ def predict_api():
 
 @app.get("/health")
 def health():
+    model_bundle = get_bundle()
+    if model_bundle is None:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "model_path": str(MODEL_PATH),
+                    "model_loaded": False,
+                    "error": bundle_error,
+                }
+            ),
+            500,
+        )
     return jsonify({"status": "ok", "model_path": str(MODEL_PATH), "model_loaded": True}), 200
 
 
