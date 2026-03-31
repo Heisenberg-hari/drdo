@@ -37,6 +37,30 @@ def get_bundle() -> dict | None:
         return None
 
 
+def _resolve_model_context(model_obj: object) -> dict:
+    # Supports both:
+    # 1) bundle dict export {"model", "imputer", "feature_cols", ...}
+    # 2) plain estimator export
+    if isinstance(model_obj, dict) and "model" in model_obj:
+        return {
+            "model": model_obj["model"],
+            "imputer": model_obj.get("imputer"),
+            "feature_cols": model_obj.get("feature_cols"),
+            "threshold": float(model_obj.get("threshold", 0.5)),
+            "motion_median": float(model_obj.get("motion_median", 0.0)),
+            "use_poly": bool(model_obj.get("use_poly", False)),
+        }
+
+    return {
+        "model": model_obj,
+        "imputer": None,
+        "feature_cols": None,
+        "threshold": 0.5,
+        "motion_median": 0.0,
+        "use_poly": False,
+    }
+
+
 def estimate_remaining_minutes(pulse: float, spo2: float, temp: float, motion: float, body_pressure: float) -> float:
     if pulse <= 0 or spo2 < 50:
         return 0.0
@@ -62,10 +86,11 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     model_bundle = get_bundle()
     if model_bundle is None:
         raise RuntimeError(bundle_error or "Model bundle is not available.")
+    ctx = _resolve_model_context(model_bundle)
 
     out = df.copy()
-    motion_median = float(model_bundle.get("motion_median", 0.0))
-    use_poly = bool(model_bundle.get("use_poly", False))
+    motion_median = float(ctx["motion_median"])
+    use_poly = bool(ctx["use_poly"])
 
     out["pulse_temp_ratio"] = out["pulse_bpm"] / (out["temperature_c"] + 1e-6)
     out["pressure_diff"] = out["external_pressure"] - out["body_pressure"]
@@ -85,6 +110,7 @@ def predict_from_payload(payload: dict) -> tuple[dict | None, str | None]:
     model_bundle = get_bundle()
     if model_bundle is None:
         return None, bundle_error or "Model could not be loaded."
+    ctx = _resolve_model_context(model_bundle)
 
     missing = [col for col in NUM_COLS if col not in payload]
     if missing:
@@ -95,15 +121,35 @@ def predict_from_payload(payload: dict) -> tuple[dict | None, str | None]:
     except (TypeError, ValueError):
         return None, "All input fields must be numeric."
 
-    sample[NUM_COLS] = model_bundle["imputer"].transform(sample[NUM_COLS])
-    sample = _clip_physically_impossible(sample)
-    sample = _engineer_features(sample)
+    try:
+        if ctx["imputer"] is not None:
+            sample[NUM_COLS] = ctx["imputer"].transform(sample[NUM_COLS])
+        sample = _clip_physically_impossible(sample)
+        engineered = _engineer_features(sample)
 
-    dead_probability = float(
-        model_bundle["model"].predict_proba(sample[model_bundle["feature_cols"]])[:, 1][0]
-    )
-    threshold = float(model_bundle["threshold"])
-    status = "Dead" if dead_probability >= threshold else "Alive"
+        feature_cols = ctx["feature_cols"]
+        if not feature_cols:
+            n_features = int(getattr(ctx["model"], "n_features_in_", len(NUM_COLS)))
+            if n_features == len(NUM_COLS):
+                feature_cols = NUM_COLS
+            else:
+                feature_cols = [c for c in engineered.columns if c != "prediction"]
+
+        model_input = engineered[feature_cols]
+        model = ctx["model"]
+
+        if hasattr(model, "predict_proba"):
+            dead_probability = float(model.predict_proba(model_input)[:, 1][0])
+            threshold = float(ctx["threshold"])
+            pred_label = int(dead_probability >= threshold)
+        else:
+            pred_label = int(model.predict(model_input)[0])
+            dead_probability = float(pred_label)
+            threshold = float(ctx["threshold"])
+    except Exception as exc:
+        return None, f"Prediction failed: {exc}"
+
+    status = "Dead" if pred_label == 1 else "Alive"
 
     response = {
         "status": status,
